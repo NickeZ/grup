@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::process;
 use structopt::StructOpt;
 
+use inotify::{Inotify, WatchMask, EventMask};
+
 #[derive(Debug, StructOpt)]
 /// grup - a offline github markdown previewer
 struct Cfg {
@@ -59,11 +61,59 @@ fn main() {
         process::exit(-1);
     }
 
-    // TODO: setup notify hook on file
-    // - calls of inotify (debounced is fine; take Write Events; reparse and re-render)
+    let mut inotify = Inotify::init().expect("inotify init failed");
+    let parent = if let Some(parent) = file.parent() {
+        if parent.to_str().unwrap() != "" {
+            parent
+        } else {
+            std::path::Path::new(".")
+        }
+    } else {
+        std::path::Path::new(".")
+    };
+
+    info!("parent {:?}", parent);
+
+    inotify.add_watch(&parent, WatchMask::MODIFY | WatchMask::CREATE).expect("failed to watch");
+
+    let modified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    std::thread::spawn( {
+        let file = file.clone();
+        let modified = modified.clone();
+        move ||{
+            loop {
+                let mut buf = [0u8; 1024];
+                let events = inotify.read_events_blocking(&mut buf).expect("failed to read events");
+                for event in events {
+                    if event.mask.contains(EventMask::CREATE) {
+                        info!("file created {:?}", event.name.unwrap());
+                    } else if event.mask.contains(EventMask::MODIFY) {
+                        info!("file modified {:?}", event.name.unwrap());
+                    }
+                    if &event.name.unwrap() == &file.to_str().unwrap() {
+                        modified.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
 
     let mut server = Server::new(move |request, mut response| {
         info!("Request received. {} {}", request.method(), request.uri());
+
+        let interval = 60;
+
+        if request.uri().path() == "/update" {
+            for _i in 0..interval {
+                if modified.compare_and_swap(true, false, std::sync::atomic::Ordering::Relaxed) == true {
+
+                    return Ok(response.body("yes".as_bytes().to_vec())?);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+            return Ok(response.body("no".as_bytes().to_vec())?);
+        }
 
         // if they want the stylesheet serve it
         // else give them the formatted MD file
@@ -107,9 +157,26 @@ fn main() {
                 <article class="markdown-body">
                 {}
                 <article class="markdown-body">
+                <script type="text/javascript">
+                function reload_check () {{
+                    var xhr = new XMLHttpRequest();
+                    xhr.overrideMimeType("text/plain");
+                    xhr.onreadystatechange = function () {{
+                        if (this.status == 200) {{
+                            if (this.responseText == "yes") {{
+                                location.reload();
+                            }}
+                        }}
+                    }}
+                    xhr.open("GET", "/update", true);
+                    xhr.send();
+                }}
+                reload_check();
+                window.setInterval(reload_check, {});
+                </script>
                 </body>
             </html>"#,
-            title, parsed_and_formatted
+            title, parsed_and_formatted, interval*1000
         );
 
         Ok(response.body(doc.into_bytes())?)
